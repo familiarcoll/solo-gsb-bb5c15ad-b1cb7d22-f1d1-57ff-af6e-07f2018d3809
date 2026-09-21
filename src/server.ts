@@ -15,6 +15,7 @@ import {
   type FragmentDecision,
 } from './service';
 import { toCsv, toMarkdown } from './exporter';
+import { buildResolutionDraft, toResolutionMarkdown, resolutionDraftToJson } from './resolution';
 import { seedDemo } from './demo';
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -294,6 +295,44 @@ app.get('/api/comparisons/:id/export', (req, res) => {
     return res.send(toMarkdown(detail));
   }
   return badRequest(res, 'format 需为 json / csv / md');
+});
+
+// ---------- 决议稿 ----------
+/** 决议稿：仅当所有差异片段均已有结论时可生成（只读，不改变封存写保护） */
+function buildOrReject(res: express.Response, comparisonId: number) {
+  const result = buildResolutionDraft(db, comparisonId);
+  if (result.status === 'not_found') {
+    notFound(res, '比对不存在');
+    return null;
+  }
+  if (result.status === 'blocked') {
+    conflict(res, '仍有差异片段未作出结论，无法生成决议稿', {
+      undecided_fragment_ords: result.undecidedOrds,
+    });
+    return null;
+  }
+  return result.draft;
+}
+
+app.get('/api/comparisons/:id/resolution', (req, res) => {
+  const draft = buildOrReject(res, Number(req.params.id));
+  if (!draft) return;
+  res.json(resolutionDraftToJson(draft));
+});
+
+app.get('/api/comparisons/:id/resolution.md', (req, res) => {
+  const draft = buildOrReject(res, Number(req.params.id));
+  if (!draft) return;
+  const filename = `决议稿-${draft.comparison.projectName}-${draft.comparison.oldLabel}-vs-${draft.comparison.newLabel}`;
+  res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename*=UTF-8''${encodeURIComponent(filename)}.md`
+  );
+  // 显式写入 BOM，保证中文在各类下载场景下按 UTF-8 正确识别
+  const buf = Buffer.from('\uFEFF' + toResolutionMarkdown(draft), 'utf-8');
+  res.setHeader('Content-Length', String(buf.length));
+  res.end(buf);
 });
 
 // ---------- 示例数据 ----------

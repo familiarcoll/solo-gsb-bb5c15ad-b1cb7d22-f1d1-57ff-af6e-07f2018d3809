@@ -133,6 +133,131 @@ async function renderProject(id) {
 
 const cmp = { id: null, data: null, status: 'all', author: 'all', onlyAnnotated: false };
 
+const RESOLUTION_SOURCE_LABEL = {
+  unchanged: '未变更',
+  accepted: '接受 · 采用新版',
+  rejected: '拒绝 · 恢复旧版',
+  deferred: '暂缓 · 暂用新版',
+};
+
+/* ================= 视图：决议稿 ================= */
+
+function resolutionParaHtml(p) {
+  return `
+    <div class="res-para rp-${p.source}">
+      <div class="res-para-meta">
+        <span class="res-src rs-${p.source}">${RESOLUTION_SOURCE_LABEL[p.source]}</span>
+        ${p.fragment_ord != null
+          ? `<span class="dim">片段 #${p.fragment_ord}（${TYPE_LABEL[p.fragment_type]}）</span>`
+          : '<span class="dim">未变更</span>'}
+        <span class="dim">第 ${p.seq} 段
+          ${p.old_index != null ? ` · 旧¶${p.old_index}` : ''}
+          ${p.new_index != null ? ` · 新¶${p.new_index}` : ''}
+        </span>
+      </div>
+      <pre class="res-para-text">${esc(p.text)}</pre>
+    </div>`;
+}
+
+function resolutionTodoHtml(t) {
+  return `
+    <li class="res-todo">
+      <div class="res-todo-head">
+        <span class="badge ft-${t.fragment_type}">${TYPE_LABEL[t.fragment_type]}</span>
+        <b>片段 #${t.fragment_ord}</b>
+        <span class="dim">${t.old_index != null ? `旧¶${t.old_index}` : ''}${t.old_index != null && t.new_index != null ? ' → ' : ''}${t.new_index != null ? `新¶${t.new_index}` : ''}</span>
+        ${t.decided_by ? `<span class="dim">${esc(t.decided_by)}${t.decided_at ? ` · ${esc(t.decided_at)}` : ''}</span>` : ''}
+      </div>
+      <div class="res-todo-reason">暂缓理由：${esc(t.reason || '（未填写）')}</div>
+      ${t.text != null ? `<pre class="res-todo-text">${esc(t.text)}</pre>` : '<div class="dim">该片段为删除项，无新版内容，未进入正文。</div>'}
+    </li>`;
+}
+
+function drawResolutionModal(draft) {
+  const c = draft.comparison;
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.id = 'resolution-modal';
+  modal.innerHTML = `
+    <div class="modal" role="dialog" aria-modal="true" aria-label="决议稿预览">
+      <div class="modal-head">
+        <h2>🧾 决议稿：${esc(c.project_name)}</h2>
+        <button class="btn small" data-action="close-resolution" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-sub">
+        <span class="dim">${esc(c.old_label)} → ${esc(c.new_label)}</span>
+        <span class="dim">生成时间 ${esc(c.generated_at)}</span>
+        ${c.sealed_at ? '<span class="seal-badge">🔒 已封存</span>' : '<span class="draft-badge">📝 草稿</span>'}
+        <a class="btn small primary" href="/api/comparisons/${c.id}/resolution.md">⬇ 下载 UTF-8 Markdown</a>
+      </div>
+      <div class="modal-body">
+        <div class="res-stats">
+          <span class="chip">正文 ${draft.stats.paragraphs} 段</span>
+          <span class="chip dc-none">未变更 ${draft.stats.unchanged}</span>
+          <span class="chip dc-accepted">接受 ${draft.stats.accepted}</span>
+          <span class="chip dc-rejected">拒绝 ${draft.stats.rejected}</span>
+          <span class="chip dc-deferred">暂缓 ${draft.stats.deferred}</span>
+          <span class="chip st-pending_review">未进入正文 ${draft.stats.omitted}</span>
+        </div>
+
+        <h3>正文预览</h3>
+        <div class="res-paras">${draft.paragraphs.map(resolutionParaHtml).join('')}</div>
+
+        <h3 class="res-todo-title">🟠 暂缓待办清单（${draft.deferred_todos.length} 项）</h3>
+        ${draft.deferred_todos.length === 0
+          ? '<p class="empty">无暂缓事项。</p>'
+          : `<ol class="res-todo-list">${draft.deferred_todos.map(resolutionTodoHtml).join('')}</ol>`}
+
+        ${draft.omitted_fragments.length > 0 ? `
+        <details class="res-omitted">
+          <summary class="dim">未进入正文的片段（${draft.omitted_fragments.length} 个：接受的删除 / 拒绝的新增 / 暂缓的删除）</summary>
+          <ul>
+            ${draft.omitted_fragments.map((o) => `
+              <li>
+                <span class="badge ft-${o.fragment_type}">${TYPE_LABEL[o.fragment_type]}</span>
+                片段 #${o.fragment_ord}（${o.decision === 'accepted' ? '接受' : o.decision === 'deferred' ? '暂缓' : '拒绝'}）
+                <pre class="res-todo-text">${esc(o.text ?? '')}</pre>
+              </li>`).join('')}
+          </ul>
+        </details>` : ''}
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+function closeResolutionModal() {
+  document.getElementById('resolution-modal')?.remove();
+}
+
+async function openResolution(comparisonId, btn) {
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/comparisons/${comparisonId}/resolution`);
+    if (!res.ok) {
+      let msg = `生成失败（${res.status}）`;
+      try {
+        const j = await res.json();
+        if (j.error) {
+          msg = j.undecided_fragment_ords?.length
+            ? `${j.error}：片段 #${j.undecided_fragment_ords.slice(0, 5).join('、#')}${
+                j.undecided_fragment_ords.length > 5 ? ' 等' : ''
+              }`
+            : j.error;
+        }
+      } catch { /* ignore */ }
+      toast(msg, true);
+      return;
+    }
+    const draft = await res.json();
+    closeResolutionModal();
+    drawResolutionModal(draft);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function renderComparison(id) {
   const data = await api('GET', `/api/comparisons/${id}`);
   if (cmp.id !== id) {
@@ -325,6 +450,12 @@ function drawComparison() {
             ? '<span class="seal-badge big">🔒 已封存</span>'
             : '<span class="draft-badge big">📝 草稿</span>'}
           <div class="export-bar">
+            <button class="btn small primary" data-action="gen-resolution" data-id="${cmp.id}"
+              ${stats.decisions.undecided === 0 ? '' : 'disabled'}
+              title="${stats.decisions.undecided === 0 ? '所有片段均已有结论，可生成决议稿' : `尚有 ${stats.decisions.undecided} 个片段未作结论，全部结论后才能生成决议稿`}">
+              🧾 生成决议稿
+            </button>
+            <span class="export-sep">|</span>
             导出：
             <a class="btn small" href="/api/comparisons/${cmp.id}/export?format=json">JSON</a>
             <a class="btn small" href="/api/comparisons/${cmp.id}/export?format=csv">CSV</a>
@@ -482,8 +613,11 @@ document.addEventListener('click', async (e) => {
       } finally {
         btn.disabled = false;
       }
-    } else if (action === 'seal') {
-      const input = document.getElementById('seal-by');
+    } else if (action === 'gen-resolution') {
+      await openResolution(btn.dataset.id, btn);
+    } else if (action === 'close-resolution') {
+      closeResolutionModal();
+    } else if (action === 'seal') {      const input = document.getElementById('seal-by');
       const sealedBy = input.value.trim();
       if (!sealedBy) {
         toast('请填写封存人姓名', true);
@@ -566,3 +700,12 @@ async function route() {
 
 window.addEventListener('hashchange', route);
 route();
+
+/* 决议稿弹窗：点击遮罩或按 Esc 关闭；路由切换时一并关闭 */
+document.addEventListener('click', (e) => {
+  if (e.target.id === 'resolution-modal') closeResolutionModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeResolutionModal();
+});
+window.addEventListener('hashchange', () => closeResolutionModal());
