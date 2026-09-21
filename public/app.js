@@ -5,6 +5,7 @@
 const STATUS_LABEL = { open: '待处理', resolved: '已解决', pending_review: '待复核' };
 const TYPE_LABEL = { added: '新增', removed: '删除', changed: '修改' };
 const DECISION_LABEL = { accepted: '接受变更', rejected: '拒绝变更', deferred: '暂缓' };
+const SOURCE_LABEL = { unchanged: '未变更', new: '采用新版', old: '恢复旧版' };
 
 const app = document.getElementById('app');
 
@@ -131,7 +132,7 @@ async function renderProject(id) {
 
 /* ================= 视图：比对详情 ================= */
 
-const cmp = { id: null, data: null, status: 'all', author: 'all', onlyAnnotated: false };
+const cmp = { id: null, data: null, status: 'all', author: 'all', onlyAnnotated: false, resolution: null };
 
 async function renderComparison(id) {
   const data = await api('GET', `/api/comparisons/${id}`);
@@ -142,6 +143,7 @@ async function renderComparison(id) {
   }
   cmp.id = id;
   cmp.data = data;
+  cmp.resolution = null; // 结论可能已变化，决议稿需重新生成
   drawComparison();
 }
 
@@ -300,6 +302,73 @@ function sealPanelHtml(data) {
     </div>`;
 }
 
+/* ================= 决议稿 ================= */
+
+function resolutionHtml(r) {
+  const paras = r.paragraphs.map((p) => {
+    const fragTag = p.fragment_ord != null
+      ? `片段 #${p.fragment_ord}（${TYPE_LABEL[p.fragment_type]} · ${DECISION_LABEL[p.decision]}）`
+      : '无对应差异片段';
+    return `
+      <div class="res-para src-${p.source}${p.decision === 'deferred' ? ' is-deferred' : ''}">
+        <div class="res-meta">
+          <span class="res-ord">¶${p.ord}</span>
+          <span class="badge src-${p.source}">${SOURCE_LABEL[p.source]}</span>
+          ${p.decision === 'deferred' ? '<span class="badge dc-deferred">暂缓</span>' : ''}
+          <span class="dim">${fragTag}</span>
+        </div>
+        <pre class="res-text">${esc(p.text)}</pre>
+      </div>`;
+  }).join('');
+
+  const todos = r.todos.map((t) => `
+    <li class="todo-item">
+      <div>
+        <b>片段 #${t.fragment_ord}（${TYPE_LABEL[t.fragment_type]}）</b>
+        <span class="dim">${t.kept === 'absent' ? '决议稿暂维持删除（新版不含该段）' : '决议稿暂保留新版内容'}</span>
+      </div>
+      <div class="todo-reason">暂缓理由：${esc(t.reason)}</div>
+      <div class="dim">提出人：${esc(t.decided_by || '（未署名）')}${t.decided_at ? ` · ${esc(t.decided_at)}` : ''}</div>
+    </li>`).join('');
+
+  return `
+    <div class="resolution-panel">
+      <div class="res-head">
+        <h3>📄 决议稿 <span class="dim">生成于 ${esc(r.generated_at)} · 共 ${r.stats.total} 段</span></h3>
+        <div class="res-actions">
+          <a class="btn small" href="/api/comparisons/${cmp.id}/resolution?format=md">⬇ 下载 Markdown（UTF-8）</a>
+          <button class="btn small" data-action="close-resolution">收起</button>
+        </div>
+      </div>
+      <div class="stats">
+        <span class="chip src-unchanged">未变更 ${r.stats.unchanged}</span>
+        <span class="chip src-new">采用新版 ${r.stats.from_new}</span>
+        <span class="chip src-old">恢复旧版 ${r.stats.from_old}</span>
+        <span class="chip dc-deferred${r.stats.deferred > 0 ? ' hot' : ''}">暂缓待办 ${r.stats.deferred}</span>
+      </div>
+      ${r.todos.length > 0 ? `
+        <div class="todo-box">
+          <h4>⏸ 暂缓待办清单（${r.todos.length} 项）</h4>
+          <ol>${todos}</ol>
+        </div>` : ''}
+      <div class="res-body">${paras}</div>
+    </div>`;
+}
+
+function resolutionBarHtml(data) {
+  const undecided = data.stats.decisions.undecided;
+  const ready = undecided === 0;
+  return `
+    <div class="resolution-bar">
+      <button class="btn" data-action="gen-resolution" ${ready ? '' : 'disabled'}
+        title="${ready ? '依据全部片段结论重建正文' : '尚有片段未作结论'}">📄 生成决议稿</button>
+      <span class="dim">${ready
+        ? '全部片段已有结论：接受 → 采用新版，拒绝 → 恢复旧版，暂缓 → 暂保留新版并列入待办清单'
+        : `尚有 ${undecided} 个片段未作结论，全部有结论后才能生成决议稿`}</span>
+    </div>
+    ${cmp.resolution ? resolutionHtml(cmp.resolution) : ''}`;
+}
+
 function drawComparison() {
   const { comparison, fragments, unanchored, stats } = cmp.data;
   const authors = [...new Set(allAnnotations().map((a) => a.author))].sort();
@@ -351,6 +420,8 @@ function drawComparison() {
         <span class="chip st-pending_review${stats.annotations.pending_review > 0 ? ' hot' : ''}">待复核批注 ${stats.annotations.pending_review}</span>
         <span class="chip st-resolved">已解决 ${stats.annotations.resolved}</span>
       </div>
+
+      ${resolutionBarHtml(cmp.data)}
 
       <div class="filter-bar">
         <label>状态
@@ -482,6 +553,19 @@ document.addEventListener('click', async (e) => {
       } finally {
         btn.disabled = false;
       }
+    } else if (action === 'gen-resolution') {
+      btn.disabled = true;
+      try {
+        cmp.resolution = await api('GET', `/api/comparisons/${cmp.id}/resolution`);
+        drawComparison();
+        toast('决议稿已生成');
+      } catch (err) {
+        await renderComparison(cmp.id);
+        throw err;
+      }
+    } else if (action === 'close-resolution') {
+      cmp.resolution = null;
+      drawComparison();
     } else if (action === 'seal') {
       const input = document.getElementById('seal-by');
       const sealedBy = input.value.trim();
